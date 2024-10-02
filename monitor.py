@@ -1,12 +1,16 @@
+import tkinter as tk
+import threading
+import pystray
+from PIL import Image, ImageDraw
 import os
 import getpass
 import time
-from datetime import datetime
-import threading
+from datetime import datetime, timedelta
 import pygetwindow as gw
 from openpyxl import Workbook, load_workbook
 from pynput import mouse, keyboard
 from threading import Lock
+import sys  # Import sys to check if running as executable
 
 last_activity_time = datetime.now()
 last_window_title = None
@@ -25,8 +29,49 @@ activity_folder = os.path.join(documents_folder, "Activity")
 
 excel_lock = Lock()
 
-# Sleep interval for the monitoring loop
 sleep_interval = 1  # Sleep interval in seconds
+
+total_idle_time = timedelta()
+total_working_time = timedelta()
+total_idle_time_lock = Lock()
+total_working_time_lock = Lock()
+
+icon = None
+
+
+def create_image():
+    width = 64
+    height = 64
+    color1 = 'blue'
+    color2 = 'white'
+
+    image = Image.new('RGB', (width, height), color1)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(
+        [(width // 2, 0), (width, height // 2)],
+        fill=color2)
+    draw.rectangle(
+        [(0, height // 2), (width // 2, height)],
+        fill=color2)
+    return image
+
+
+def on_quit(icon_param, item):
+    icon_param.visible = False
+    root.quit()
+def show_window(icon_param, item):
+    icon_param.visible = False
+    root.after(0, root.deiconify)
+
+
+def withdraw_window():
+    root.withdraw()
+    icon.visible = True
+
+
+def on_minimize(event):
+    if root.state() == 'iconic':
+        withdraw_window()
 
 
 def get_log_path():
@@ -151,70 +196,150 @@ def backup_excel_file():
 
 def monitor_activity():
     global last_activity_time, idle_start_time, current_activity_start_time, last_window_title, current_date, last_backup_time
+    global total_idle_time, total_working_time, is_idle  # Added is_idle to global
+
+    is_idle = False
 
     while True:
         current_time = datetime.now()
-
         time_since_last_activity = (current_time - last_activity_time).total_seconds()
 
-        if current_time.date() != current_date:
-            # Handle the end of the day
-            end_of_day = datetime.combine(current_date, datetime.max.time())
-            if idle_start_time:
-                log_to_excel("Idle", "Idle Hours", idle_start_time, end_of_day)
-                idle_start_time = None
-            elif last_window_title:
-                log_to_excel("Working", last_window_title, current_activity_start_time, end_of_day)
+        if time_since_last_activity >= idle_threshold:
+            if not is_idle:
+                is_idle = True
+                idle_start_time = last_activity_time + timedelta(seconds=idle_threshold)
+                if last_window_title and current_activity_start_time:
+                    working_duration = idle_start_time - current_activity_start_time
+                    with total_working_time_lock:
+                        total_working_time += working_duration
+                    log_to_excel("Working", last_window_title, current_activity_start_time, idle_start_time)
+                current_activity_start_time = None
                 last_window_title = None
-
-            current_date = current_time.date()
-            initialize_workbook()  # Create a new workbook for the new day
-            current_activity_start_time = datetime.combine(current_date, datetime.min.time())
-
-        if time_since_last_activity < idle_threshold:
-            if idle_start_time:
-                log_to_excel("Idle", "Idle Hours", idle_start_time, current_time)
-                idle_start_time = None
-
-            active_window = get_active_window()
-            if active_window != last_window_title:
-                if last_window_title:
-                    log_to_excel("Working", last_window_title, current_activity_start_time, current_time)
-
-                current_activity_start_time = current_time
-                last_window_title = active_window
         else:
-            if not idle_start_time:
-                idle_start_time = current_time
-                if last_window_title:
-                    log_to_excel("Working", last_window_title, current_activity_start_time, current_time)
-                    last_window_title = None
+            if is_idle:
+                is_idle = False
+                idle_end_time = last_activity_time
+                idle_duration = idle_end_time - idle_start_time
+                with total_idle_time_lock:
+                    total_idle_time += idle_duration
+                log_to_excel("Idle", "Idle Hours", idle_start_time, idle_end_time)
+                idle_start_time = None
+                current_activity_start_time = last_activity_time
+                last_window_title = get_active_window()
+            else:
+                active_window = get_active_window()
+                if active_window != last_window_title:
+                    if last_window_title and current_activity_start_time:
+                        duration = current_time - current_activity_start_time
+                        with total_working_time_lock:
+                            total_working_time += duration
+                        log_to_excel("Working", last_window_title, current_activity_start_time, current_time)
+                    current_activity_start_time = current_time
+                    last_window_title = active_window
 
-        # Check if it's time to back up the Excel file
         if (current_time - last_backup_time).total_seconds() >= backup_interval_in_hours * 3600:
             backup_excel_file()
             last_backup_time = current_time
 
-        time.sleep(sleep_interval)  # Check every 1 second
+        time.sleep(sleep_interval)
 
+
+def update_gui():
+    current_time = datetime.now()
+
+    with total_idle_time_lock:
+        idle_time = total_idle_time
+    with total_working_time_lock:
+        working_time = total_working_time
+
+    if is_idle:
+        if idle_start_time:
+            idle_time += current_time - idle_start_time
+    else:
+        if current_activity_start_time:
+            working_time += current_time - current_activity_start_time
+
+    total_time = idle_time + working_time
+
+    idle_seconds = int(idle_time.total_seconds())
+    working_seconds = int(working_time.total_seconds())
+    total_seconds = int(total_time.total_seconds())
+
+    total_hours, total_remainder = divmod(total_seconds, 3600)
+    total_minutes, total_secs = divmod(total_remainder, 60)
+
+    working_hours, working_remainder = divmod(working_seconds, 3600)
+    working_minutes, working_secs = divmod(working_remainder, 60)
+
+    idle_hours, idle_remainder = divmod(idle_seconds, 3600)
+    idle_minutes, idle_secs = divmod(idle_remainder, 60)
+
+    total_time_str = f"{total_hours}h {total_minutes}m {total_secs}s"
+    working_time_str = f"{working_hours}h {working_minutes}m {working_secs}s"
+    idle_time_str = f"{idle_hours}h {idle_minutes}m {idle_secs}s"
+
+    # Update the labels
+    total_label.config(text=f"Total Time: {total_time_str}")
+    working_label.config(text=f"Working Time: {working_time_str}")
+    idle_label.config(text=f"Idle Time: {idle_time_str}")
+
+    root.after(1000, update_gui)  # Update every second
+
+def setup_icon():
+    global icon
+    image = create_image()
+    menu = pystray.Menu(
+        pystray.MenuItem('Show', show_window),
+        pystray.MenuItem('Exit', on_quit)
+    )
+    icon = pystray.Icon("name", image, "Activity Monitor", menu)
+    icon.visible = False  # Initially invisible
+    threading.Thread(target=icon.run, daemon=True).start()
 
 if __name__ == "__main__":
-    try:
-        initialize_workbook()
+    root = tk.Tk()
+    root.title("Activity Monitor")
+    root.geometry("200x200")
 
-        mouse_listener = mouse.Listener(on_click=on_click, on_move=on_move)
-        keyboard_listener = keyboard.Listener(on_press=on_press)
+    # Bind the minimize event
+    root.bind("<Unmap>", on_minimize)
 
-        mouse_listener.start()
-        keyboard_listener.start()
+    # Handle the window close button
+    root.protocol('WM_DELETE_WINDOW', root.iconify)
 
-        activity_thread = threading.Thread(target=monitor_activity)
-        activity_thread.daemon = True
-        activity_thread.start()
+    # Create labels to display the times
+    total_label = tk.Label(root, text="Total Time: 0h 0m 0s", font=("Helvetica", 12))
+    total_label.pack(pady=5)
 
-        mouse_listener.join()
-        keyboard_listener.join()
-    except KeyboardInterrupt:
-        print("Shutting down gracefully.")
-        mouse_listener.stop()
-        keyboard_listener.stop()
+    working_label = tk.Label(root, text="Working Time: 0h 0m 0s", font=("Helvetica", 12))
+    working_label.pack(pady=5)
+
+    idle_label = tk.Label(root, text="Idle Time: 0h 0m 0s", font=("Helvetica", 12))
+    idle_label.pack(pady=5)
+
+    initialize_workbook()
+
+    activity_thread = threading.Thread(target=monitor_activity, daemon=True)
+    activity_thread.start()
+
+    mouse_listener = mouse.Listener(on_click=on_click, on_move=on_move)
+    keyboard_listener = keyboard.Listener(on_press=on_press)
+
+    mouse_listener.start()
+    keyboard_listener.start()
+
+    update_gui()
+
+    setup_icon()
+
+    if getattr(sys, 'frozen', False):
+        # If running as an executable, start minimized in system tray
+        withdraw_window()
+    else:
+        # If running as script, show the main window
+        root.deiconify()
+
+    root.mainloop()
+
+    mouse_listener.stop()
+    keyboard_listener.stop()
